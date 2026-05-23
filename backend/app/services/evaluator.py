@@ -1,10 +1,13 @@
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from anthropic import AsyncAnthropic, RateLimitError, InternalServerError, APITimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from ..database import get_conn
 from ..jobs import update_job
+
+log = logging.getLogger(__name__)
 
 SEMAPHORE_LIMIT = 5
 _semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
@@ -68,87 +71,105 @@ async def run_query_job(
     model: str,
     video_ids: list[int] | None,
 ) -> None:
-    await asyncio.to_thread(update_job, job_id, status="running")
+    """Run AI evaluation job with proper resource cleanup and error handling."""
+    try:
+        await asyncio.to_thread(update_job, job_id, status="running")
 
-    # Fetch chunks to evaluate (skip already evaluated ones)
-    with get_conn() as conn:
-        if video_ids:
-            rows = conn.execute(
-                """
-                SELECT c.id, c.start_sec, c.end_sec, c.text, v.youtube_id, v.title AS video_title
-                FROM chunks c
-                JOIN videos v ON v.id = c.video_id
-                WHERE v.id = ANY(%s)
-                  AND v.scraped_at IS NOT NULL
-                  AND c.id NOT IN (
-                      SELECT chunk_id FROM results WHERE query_id = %s
-                  )
-                """,
-                (list(video_ids), query_id),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT c.id, c.start_sec, c.end_sec, c.text, v.youtube_id, v.title AS video_title
-                FROM chunks c
-                JOIN videos v ON v.id = c.video_id
-                WHERE v.scraped_at IS NOT NULL
-                  AND c.id NOT IN (
-                      SELECT chunk_id FROM results WHERE query_id = %s
-                  )
-                """,
-                (query_id,),
-            ).fetchall()
+        # Fetch chunks to evaluate (skip already evaluated ones)
+        with get_conn() as conn:
+            if video_ids:
+                rows = conn.execute(
+                    """
+                    SELECT c.id, c.start_sec, c.end_sec, c.text, v.youtube_id, v.title AS video_title
+                    FROM chunks c
+                    JOIN videos v ON v.id = c.video_id
+                    WHERE v.id = ANY(%s)
+                      AND v.scraped_at IS NOT NULL
+                      AND c.id NOT IN (
+                          SELECT chunk_id FROM results WHERE query_id = %s
+                      )
+                    """,
+                    (list(video_ids), query_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT c.id, c.start_sec, c.end_sec, c.text, v.youtube_id, v.title AS video_title
+                    FROM chunks c
+                    JOIN videos v ON v.id = c.video_id
+                    WHERE v.scraped_at IS NOT NULL
+                      AND c.id NOT IN (
+                          SELECT chunk_id FROM results WHERE query_id = %s
+                      )
+                    """,
+                    (query_id,),
+                ).fetchall()
 
-    chunks = [dict(r) for r in rows]
-    await asyncio.to_thread(update_job, job_id, total=len(chunks))
+        chunks = [dict(r) for r in rows]
+        await asyncio.to_thread(update_job, job_id, total=len(chunks))
 
-    if not chunks:
+        if not chunks:
+            await asyncio.to_thread(update_job, job_id, status="done")
+            return
+
+        # Create client with explicit timeout
+        client = AsyncAnthropic(timeout=90.0)
+        evaluated = 0
+
+        def _write_result(chunk_id: int, result: dict) -> None:
+            with get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO results (query_id, chunk_id, score, reasoning, topic, evaluated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (query_id, chunk_id) DO UPDATE SET
+                        score = EXCLUDED.score,
+                        reasoning = EXCLUDED.reasoning,
+                        topic = EXCLUDED.topic,
+                        evaluated_at = EXCLUDED.evaluated_at
+                    """,
+                    (query_id, chunk_id, result["score"], result["reasoning"], result["topic"], _now()),
+                )
+
+        def _write_error(chunk_id: int, error_msg: str) -> None:
+            with get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO results (query_id, chunk_id, score, reasoning, topic, evaluated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (query_id, chunk_id) DO UPDATE SET
+                        score = EXCLUDED.score,
+                        reasoning = EXCLUDED.reasoning,
+                        topic = EXCLUDED.topic,
+                        evaluated_at = EXCLUDED.evaluated_at
+                    """,
+                    (query_id, chunk_id, 0, f"Evaluation error: {error_msg[:80]}", None, _now()),
+                )
+
+        async def process_one(chunk: dict) -> None:
+            nonlocal evaluated
+            try:
+                result = await _score_chunk(client, intent, chunk, model)
+                await asyncio.to_thread(_write_result, chunk["id"], result)
+            except Exception as e:
+                log.exception("Error evaluating chunk %s: %s", chunk["id"], e)
+                await asyncio.to_thread(_write_error, chunk["id"], str(e))
+            finally:
+                evaluated += 1
+                await asyncio.to_thread(update_job, job_id, completed=evaluated)
+
+        await asyncio.gather(*[process_one(c) for c in chunks])
         await asyncio.to_thread(update_job, job_id, status="done")
-        return
 
-    client = AsyncAnthropic(timeout=30.0)
-    evaluated = 0
-
-    def _write_result(chunk_id: int, result: dict) -> None:
-        with get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO results (query_id, chunk_id, score, reasoning, topic, evaluated_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (query_id, chunk_id) DO UPDATE SET
-                    score = EXCLUDED.score,
-                    reasoning = EXCLUDED.reasoning,
-                    topic = EXCLUDED.topic,
-                    evaluated_at = EXCLUDED.evaluated_at
-                """,
-                (query_id, chunk_id, result["score"], result["reasoning"], result["topic"], _now()),
-            )
-
-    def _write_error(chunk_id: int, error_msg: str) -> None:
-        with get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO results (query_id, chunk_id, score, reasoning, topic, evaluated_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (query_id, chunk_id) DO UPDATE SET
-                    score = EXCLUDED.score,
-                    reasoning = EXCLUDED.reasoning,
-                    topic = EXCLUDED.topic,
-                    evaluated_at = EXCLUDED.evaluated_at
-                """,
-                (query_id, chunk_id, 0, f"Evaluation error: {error_msg[:80]}", None, _now()),
-            )
-
-    async def process_one(chunk: dict) -> None:
-        nonlocal evaluated
+    except Exception as e:
+        log.exception("Query job %s failed: %s", job_id, e)
         try:
-            result = await _score_chunk(client, intent, chunk, model)
-            await asyncio.to_thread(_write_result, chunk["id"], result)
-        except Exception as e:
-            await asyncio.to_thread(_write_error, chunk["id"], str(e))
-        evaluated += 1
-        await asyncio.to_thread(update_job, job_id, completed=evaluated)
+            await asyncio.to_thread(
+                update_job,
+                job_id,
+                status="failed",
+                error_json=f"Job failed: {str(e)[:200]}",
+            )
+        except Exception as update_err:
+            log.exception("Failed to update job status for %s: %s", job_id, update_err)
 
-    await asyncio.gather(*[process_one(c) for c in chunks])
-    await asyncio.to_thread(update_job, job_id, status="done")
